@@ -1,0 +1,39 @@
+data:
+  jump_cp_path: "data/processed/jump_profiles.csv"
+  chembl_path: "data/processed/chembl_moa.csv"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  random_seed: 42
+
+mol_encoder:
+  hidden_dim: 256
+  num_layers: 4
+  dropout: 0.1
+  readout: "mean"        # mean | sum | attention
+
+morpho_encoder:
+  input_dim: 812         # CellProfiler feature vector size
+  hidden_dims: [512, 384]
+  output_dim: 256
+  dropout: 0.1
+  batch_norm: true
+
+clip:
+  embedding_dim: 256
+  temperature_init: 0.07
+  learnable_temperature: true
+
+training:
+  batch_size: 256
+  epochs: 100
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  warmup_epochs: 10
+  scheduler: "cosine"
+  negative_mining: "hard"   # random | hard | semi-hard
+  num_hard_negatives: 32
+
+evaluation:
+  k_values: [1, 5, 10, 20]
+  moa_retrieval: true
