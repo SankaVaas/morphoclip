@@ -62,7 +62,7 @@ def load_jump_profiles(raw_dir: str = "data/raw") -> tuple[pd.DataFrame, pd.Data
     Load and concatenate all JUMP-CP plate CSVs.
     Returns (features_df, metadata_df).
     """
-    files = sorted(glob.glob(os.path.join(raw_dir, "jump_BR*.csv.gz")))
+    files = sorted(glob.glob(os.path.join(raw_dir, "jump_*.csv.gz")))
     if not files:
         raise FileNotFoundError(
             "No JUMP-CP profile files found in data/raw/. "
