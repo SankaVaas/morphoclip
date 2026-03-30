@@ -59,10 +59,17 @@ def standardise_smiles(smi: str) -> str | None:
 
 def load_jump_profiles(raw_dir: str = "data/raw") -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Load and concatenate all JUMP-CP plate CSVs.
-    Returns (features_df, metadata_df).
+    Load and concatenate JUMP-CP plate CSVs.
+    - Real plates (jump_BR*.csv.gz) and mock (jump_mock.csv.gz) are loaded separately
+      then reconciled to a common feature set before concatenation.
+    - Drops COLUMNS with >20% NaN, then drops any remaining NaN rows.
     """
-    files = sorted(glob.glob(os.path.join(raw_dir, "jump_*.csv.gz")))
+    real_files = sorted(glob.glob(os.path.join(raw_dir, "jump_BR*.csv.gz")))
+    mock_files = sorted(glob.glob(os.path.join(raw_dir, "jump_mock.csv.gz")))
+
+    # Prefer real files; only use mock if no real files exist
+    files = real_files if real_files else mock_files
+
     if not files:
         raise FileNotFoundError(
             "No JUMP-CP profile files found in data/raw/. "
@@ -70,7 +77,22 @@ def load_jump_profiles(raw_dir: str = "data/raw") -> tuple[pd.DataFrame, pd.Data
         )
 
     print(f"  Found {len(files)} plate file(s): {[Path(f).name for f in files]}")
-    dfs = [pd.read_csv(f) for f in files]
+
+    dfs = []
+    for f in files:
+        df = pd.read_csv(f)
+        print(f"    {Path(f).name}: {df.shape[0]} wells, {df.shape[1]} cols")
+        dfs.append(df)
+
+    # Find common columns across all plates
+    if len(dfs) > 1:
+        common_cols = set(dfs[0].columns)
+        for df in dfs[1:]:
+            common_cols &= set(df.columns)
+        common_cols = sorted(common_cols)
+        print(f"  Common columns across plates: {len(common_cols)}")
+        dfs = [df[common_cols] for df in dfs]
+
     df = pd.concat(dfs, ignore_index=True)
     print(f"  Total wells loaded: {len(df)}")
 
@@ -80,14 +102,22 @@ def load_jump_profiles(raw_dir: str = "data/raw") -> tuple[pd.DataFrame, pd.Data
     metadata = df[meta_cols].copy()
     features = df[feat_cols].select_dtypes(include=[np.number]).copy()
 
-    # Drop rows with any NaN in features
+    # Drop columns with >20% NaN first
+    nan_frac = features.isna().mean()
+    bad_cols = nan_frac[nan_frac > 0.2].index.tolist()
+    if bad_cols:
+        print(f"  Dropping {len(bad_cols)} high-NaN columns (>20% missing)")
+        features = features.drop(columns=bad_cols)
+
+    # Now drop remaining rows with any NaN
     valid = features.notna().all(axis=1)
     n_dropped = (~valid).sum()
     if n_dropped:
-        print(f"  Dropping {n_dropped} rows with NaN features")
+        print(f"  Dropping {n_dropped} rows with remaining NaN values")
     features = features[valid].reset_index(drop=True)
     metadata = metadata[valid].reset_index(drop=True)
 
+    print(f"  Clean feature matrix: {features.shape[0]} wells × {features.shape[1]} features")
     return features, metadata
 
 
@@ -167,59 +197,87 @@ def match_profiles_to_moa(
     jump_meta: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Join strategy (in priority order):
-      1. If JUMP compound metadata available: join via InChIKey
-      2. Fallback: fuzzy name match on Metadata_broad_sample / Metadata_pert_iname
-
-    Returns a DataFrame with columns:
-      profile_idx, smiles, moa, compound_name  + all Metadata_ columns
+    Join strategy:
+      1. Use Metadata_smiles (already in JUMP profiles) — no external join needed
+      2. Match to ChEMBL MoA via standardised InChIKey
+      3. Fallback: pert_iname name match
     """
-    # Standardise ChEMBL SMILES
-    print("  Standardising ChEMBL SMILES...")
+    from rdkit.Chem.inchi import MolToInchiKey
+
+    # Standardise ChEMBL SMILES and compute InChIKeys
+    print("  Standardising ChEMBL SMILES and computing InChIKeys...")
     chembl_df = chembl_df.copy()
-    chembl_df["smiles"] = chembl_df["smiles"].apply(standardise_smiles)
-    chembl_df = chembl_df.dropna(subset=["smiles"]).drop_duplicates(subset=["smiles"])
-    print(f"  Valid ChEMBL SMILES after standardisation: {len(chembl_df)}")
+    chembl_df["std_smiles"] = chembl_df["smiles"].apply(standardise_smiles)
+    chembl_df = chembl_df.dropna(subset=["std_smiles"])
 
-    # Try InChIKey join if compound metadata available
-    if not jump_meta.empty and "Metadata_InChIKey" in metadata.columns:
-        print("  Joining via InChIKey...")
-        from rdkit.Chem.inchi import MolToInchiKey
-        chembl_df["inchikey"] = chembl_df["smiles"].apply(
-            lambda s: MolToInchiKey(Chem.MolFromSmiles(s)) if s else None
-        )
-        meta_with_idx = metadata.copy()
-        meta_with_idx["profile_idx"] = meta_with_idx.index
+    def smiles_to_inchikey(smi):
+        try:
+            mol = Chem.MolFromSmiles(smi)
+            return MolToInchiKey(mol) if mol else None
+        except Exception:
+            return None
+
+    chembl_df["inchikey14"] = chembl_df["std_smiles"].apply(
+        lambda s: smiles_to_inchikey(s)[:14] if smiles_to_inchikey(s) else None
+    )
+    chembl_df = chembl_df.dropna(subset=["inchikey14"]).drop_duplicates(subset=["inchikey14"])
+    print(f"  ChEMBL compounds with valid InChIKey: {len(chembl_df)}")
+
+    # Use SMILES already present in the JUMP metadata
+    meta_with_idx = metadata.copy()
+    meta_with_idx["profile_idx"] = meta_with_idx.index
+
+    if "Metadata_InChIKey" in meta_with_idx.columns:
+        print("  Joining via Metadata_InChIKey (first 14 chars)...")
+        meta_with_idx["inchikey14"] = meta_with_idx["Metadata_InChIKey"].str[:14]
         merged = meta_with_idx.merge(
-            chembl_df[["inchikey", "smiles", "moa", "compound_name"]],
-            left_on="Metadata_InChIKey",
-            right_on="inchikey",
+            chembl_df[["inchikey14", "std_smiles", "moa", "compound_name"]],
+            on="inchikey14",
             how="inner",
+        ).rename(columns={"std_smiles": "smiles"})
+
+    elif "Metadata_smiles" in meta_with_idx.columns:
+        print("  Computing InChIKeys from Metadata_smiles...")
+        meta_with_idx["inchikey14"] = meta_with_idx["Metadata_smiles"].apply(
+            lambda s: smiles_to_inchikey(s)[:14]
+            if isinstance(s, str) and smiles_to_inchikey(s) else None
         )
+        merged = meta_with_idx.dropna(subset=["inchikey14"]).merge(
+            chembl_df[["inchikey14", "std_smiles", "moa", "compound_name"]],
+            on="inchikey14",
+            how="inner",
+        ).rename(columns={"std_smiles": "smiles"})
+
     else:
-        # Name-based fallback
-        print("  Falling back to name-based matching...")
-        name_col = next(
-            (c for c in metadata.columns
-             if "pert_iname" in c.lower() or "broad_sample" in c.lower()),
-            None,
-        )
-        if name_col is None:
-            print("  [warn] No usable join key found — returning empty matches")
-            return pd.DataFrame()
-
-        meta_with_idx = metadata.copy()
-        meta_with_idx["profile_idx"] = meta_with_idx.index
-        meta_with_idx["_join_key"] = meta_with_idx[name_col].str.lower().str.strip()
-        chembl_df["_join_key"] = chembl_df["compound_name"].str.lower().str.strip()
-
+        print("  Falling back to pert_iname name match...")
+        meta_with_idx["_key"] = meta_with_idx.get(
+            "Metadata_pert_iname", pd.Series(dtype=str)
+        ).str.lower().str.strip()
+        chembl_df["_key"] = chembl_df["compound_name"].str.lower().str.strip()
         merged = meta_with_idx.merge(
-            chembl_df[["_join_key", "smiles", "moa", "compound_name"]],
-            on="_join_key",
-            how="inner",
-        ).drop(columns=["_join_key"])
+            chembl_df[["_key", "std_smiles", "moa", "compound_name"]],
+            on="_key", how="inner",
+        ).rename(columns={"std_smiles": "smiles"}).drop(columns=["_key"])
 
-    print(f"  Matched pairs: {len(merged)}")
+    # For unmatched wells, use Metadata_smiles directly with pert_iname as label
+    if len(merged) < 100 and "Metadata_smiles" in meta_with_idx.columns:
+        print("  Few ChEMBL matches — enriching with JUMP-native SMILES+pert_iname pairs...")
+        unmatched = meta_with_idx[
+            ~meta_with_idx["profile_idx"].isin(merged.get("profile_idx", pd.Series()))
+        ].copy()
+        unmatched = unmatched[
+            unmatched["Metadata_smiles"].notna() &
+            unmatched["Metadata_pert_iname"].notna() &
+            (unmatched["Metadata_pert_type"] == "trt")   # compounds only, not controls
+        ].copy()
+        unmatched["smiles"]         = unmatched["Metadata_smiles"].apply(standardise_smiles)
+        unmatched["moa"]            = unmatched["Metadata_pert_iname"]  # use name as proxy label
+        unmatched["compound_name"]  = unmatched["Metadata_pert_iname"]
+        unmatched = unmatched.dropna(subset=["smiles"])
+        merged = pd.concat([merged, unmatched], ignore_index=True)
+        print(f"  After enrichment: {len(merged)} pairs")
+
+    print(f"  Final matched pairs: {len(merged)}")
     return merged
 
 
@@ -247,9 +305,9 @@ def main(args):
     print(f"  Unique MoA classes: {len(moa_counts)}")
     print(f"  Top 5 classes:\n{moa_counts.head().to_string()}")
 
-    # 4. Load JUMP compound metadata
-    print("\n[4/5] Loading JUMP compound metadata...")
-    jump_meta = load_jump_compound_meta()
+    # 4. Skip external compound metadata — SMILES are in the profiles directly
+    print("\n[4/5] Skipping external compound metadata (SMILES in profiles already)...")
+    jump_meta = pd.DataFrame()
 
     # 5. Match
     print("\n[5/5] Matching profiles to MoA annotations...")

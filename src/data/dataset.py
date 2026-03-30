@@ -1,55 +1,54 @@
 """
-PyTorch Dataset: pairs (molecular graph, morphological profile) with MoA label.
+PyTorch Dataset: loads pre-matched (molecular graph, morphological profile, MoA) triples
+from data/processed/matched_pairs.csv and data/processed/jump_profiles.csv.
 """
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, random_split
 from torch_geometric.data import Batch
 import pandas as pd
 import numpy as np
-from typing import List, Tuple
 
-from .preprocessing import load_chembl_moa
 from ..models.mol_encoder import smiles_to_graph
 
 
 class MorphoCLIPDataset(Dataset):
     """
-    Each item: (mol_graph, morpho_profile, moa_label)
-
-    The dataset is constructed by matching compounds in the JUMP-CP
-    metadata (via Metadata_broad_sample or Metadata_pert_iname)
-    with MoA annotations from ChEMBL.
+    Loads matched pairs from the preprocessed CSV files.
+    Each item: (mol_graph, morpho_profile_tensor, moa_label)
     """
 
-    def __init__(self, profiles: pd.DataFrame, metadata: pd.DataFrame,
-                 chembl_df: pd.DataFrame, profile_cols: List[str]):
+    def __init__(self, matched_pairs: pd.DataFrame,
+                 profiles: pd.DataFrame, profile_cols: list):
         super().__init__()
 
-        # Match on InChIKey or compound name — here we use a name-based join
-        # In the real pipeline, replace with InChIKey matching for robustness
-        merged = metadata.merge(
-            chembl_df[['smiles', 'moa', 'compound_name']],
-            left_on='Metadata_broad_sample',
-            right_on='compound_name',
-            how='inner',
-        )
+        self.graphs      = []
+        self.profiles    = []
+        self.moa_labels  = []
 
-        self.graphs   = []
-        self.profiles = []
-        self.moa_labels = []
-
-        for _, row in merged.iterrows():
-            g = smiles_to_graph(row['smiles'])
+        skipped = 0
+        for _, row in matched_pairs.iterrows():
+            g = smiles_to_graph(row["smiles"])
             if g is None:
+                skipped += 1
                 continue
+
+            idx = int(row["profile_idx"])
+            if idx >= len(profiles):
+                skipped += 1
+                continue
+
+            prof_vec = profiles.iloc[idx][profile_cols].values.astype(np.float32)
+            if np.isnan(prof_vec).any():
+                skipped += 1
+                continue
+
             self.graphs.append(g)
-            # Fetch the corresponding profile row
-            idx = merged.index.get_loc(row.name)
-            self.profiles.append(
-                torch.tensor(profiles.iloc[idx][profile_cols].values, dtype=torch.float32)
-            )
-            self.moa_labels.append(row['moa'])
+            self.profiles.append(torch.tensor(prof_vec, dtype=torch.float32))
+            self.moa_labels.append(str(row["moa"]))
+
+        print(f"  Dataset: {len(self.graphs)} valid pairs "
+              f"({skipped} skipped due to invalid SMILES or NaN profiles)")
 
     def __len__(self):
         return len(self.graphs)
@@ -61,20 +60,39 @@ class MorphoCLIPDataset(Dataset):
 def morphoclip_collate(batch):
     """Custom collate: batch graphs with PyG, stack profiles as tensor."""
     graphs, profiles, moas = zip(*batch)
-    mol_batch = Batch.from_data_list(list(graphs))
+    mol_batch     = Batch.from_data_list(list(graphs))
     morpho_tensor = torch.stack(profiles)
     return mol_batch, morpho_tensor, list(moas)
 
 
 def get_dataloaders(profiles, metadata, chembl_df, profile_cols, cfg):
-    from torch.utils.data import DataLoader, random_split
+    """
+    Load matched pairs from disk and build train/val/test DataLoaders.
+    Ignores metadata and chembl_df — matching was done in preprocess.py.
+    """
+    matched_path = cfg['data'].get('matched_pairs_path',
+                                   'data/processed/matched_pairs.csv')
+    matched = pd.read_csv(matched_path)
+    print(f"  Loaded {len(matched)} matched pairs from {matched_path}")
 
-    dataset = MorphoCLIPDataset(profiles, metadata, chembl_df, profile_cols)
+    if len(matched) == 0:
+        raise RuntimeError(
+            "matched_pairs.csv is empty. "
+            "Re-run: python scripts/preprocess.py"
+        )
 
-    n = len(dataset)
-    n_train = int(n * cfg['data']['train_split'])
-    n_val   = int(n * cfg['data']['val_split'])
-    n_test  = n - n_train - n_val
+    dataset = MorphoCLIPDataset(matched, profiles, profile_cols)
+
+    if len(dataset) < 3:
+        raise RuntimeError(
+            f"Dataset too small ({len(dataset)} valid pairs). "
+            "Check preprocess output and matched_pairs.csv."
+        )
+
+    n       = len(dataset)
+    n_train = max(1, int(n * cfg['data']['train_split']))
+    n_val   = max(1, int(n * cfg['data']['val_split']))
+    n_test  = max(1, n - n_train - n_val)
 
     torch.manual_seed(cfg['data']['random_seed'])
     train_ds, val_ds, test_ds = random_split(dataset, [n_train, n_val, n_test])

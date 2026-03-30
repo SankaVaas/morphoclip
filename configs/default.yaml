@@ -1,6 +1,7 @@
 data:
   jump_cp_path: "data/processed/jump_profiles.csv"
   chembl_path: "data/processed/chembl_moa.csv"
+  matched_pairs_path: "data/processed/matched_pairs.csv"   # add this
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
@@ -25,8 +26,8 @@ clip:
   learnable_temperature: true
 
 training:
-  batch_size: 256
-  epochs: 100
+  batch_size: 32
+  epochs: 5
   lr: 3.0e-4
   weight_decay: 1.0e-4
   warmup_epochs: 10
