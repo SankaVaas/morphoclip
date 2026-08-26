@@ -15,6 +15,7 @@ import glob
 import argparse
 import numpy as np
 import pandas as pd
+import yaml
 from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem.MolStandardize import rdMolStandardize
@@ -22,22 +23,84 @@ from rdkit.Chem.MolStandardize import rdMolStandardize
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def robust_normalise(df: pd.DataFrame) -> pd.DataFrame:
+def robust_normalise(df: pd.DataFrame, fit_mask: "np.ndarray | None" = None) -> pd.DataFrame:
     """
     Median-center and MAD-scale each feature column.
-    Constant features (MAD == 0) are dropped entirely.
+    Constant features (MAD == 0, computed on the fit rows) are dropped entirely.
+
+    Args:
+        df: full feature matrix, positionally ordered (row i == well i).
+        fit_mask: optional boolean array, same length as df. When given,
+            median/MAD are computed using ONLY the rows where fit_mask is
+            True (i.e. training-split wells), then applied to transform
+            every row. This avoids leaking val/test distribution
+            information into the normalisation statistics — fitting on the
+            full dataset (the previous default) means the transform for a
+            training well is partly informed by held-out wells.
     """
-    median = df.median()
-    mad = (df - median).abs().median()
+    fit_df = df.loc[fit_mask] if fit_mask is not None else df
+
+    median = fit_df.median()
+    mad = (fit_df - median).abs().median()
 
     constant_cols = mad[mad == 0].index.tolist()
     if constant_cols:
-        print(f"  Dropping {len(constant_cols)} constant features")
+        print(f"  Dropping {len(constant_cols)} constant features (zero MAD on fit rows)")
         df = df.drop(columns=constant_cols)
         mad = mad.drop(index=constant_cols)
         median = median.drop(index=constant_cols)
 
     return (df - median) / mad
+
+
+def assign_compound_split(matched: pd.DataFrame, train_frac: float,
+                           val_frac: float, seed: int) -> pd.DataFrame:
+    """
+    Assign each matched (profile, molecule) pair to train/val/test, grouped
+    by compound identity, so that no compound's replicate wells can appear
+    in more than one split. Must run BEFORE normalisation so that
+    robust_normalise() can be fit on the training split only.
+    """
+    from sklearn.model_selection import GroupShuffleSplit
+
+    groups = matched["compound_name"].fillna(matched["smiles"]).values
+    n = len(matched)
+
+    n_groups = len(set(groups))
+    if n_groups < 3:
+        raise ValueError(
+            f"Need at least 3 distinct compounds for a leakage-safe "
+            f"train/val/test split; found {n_groups}."
+        )
+
+    gss1 = GroupShuffleSplit(n_splits=1, train_size=train_frac, random_state=seed)
+    train_idx, rest_idx = next(gss1.split(np.zeros(n), groups=groups))
+
+    rest_groups = groups[rest_idx]
+    val_rel_frac = val_frac / (1.0 - train_frac)
+    val_rel_frac = min(max(val_rel_frac, 1e-6), 1.0 - 1e-6)
+    gss2 = GroupShuffleSplit(n_splits=1, train_size=val_rel_frac, random_state=seed)
+    val_rel_idx, test_rel_idx = next(
+        gss2.split(np.zeros(len(rest_idx)), groups=rest_groups)
+    )
+    val_idx  = rest_idx[val_rel_idx]
+    test_idx = rest_idx[test_rel_idx]
+
+    split = np.empty(n, dtype=object)
+    split[train_idx] = "train"
+    split[val_idx]   = "val"
+    split[test_idx]  = "test"
+
+    train_groups = set(groups[train_idx])
+    val_groups   = set(groups[val_idx])
+    test_groups  = set(groups[test_idx])
+    assert not (train_groups & val_groups),  "compound leakage: train/val overlap"
+    assert not (train_groups & test_groups), "compound leakage: train/test overlap"
+    assert not (val_groups & test_groups),   "compound leakage: val/test overlap"
+
+    matched = matched.copy()
+    matched["split"] = split
+    return matched
 
 
 def standardise_smiles(smi: str) -> str | None:
@@ -231,33 +294,51 @@ def main(args):
     print("  MorphoCLIP — preprocessing")
     print("=" * 55)
 
-    # 1. Load profiles
-    print("\n[1/5] Loading JUMP-CP profiles...")
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    train_frac = cfg["data"]["train_split"]
+    val_frac   = cfg["data"]["val_split"]
+    seed       = cfg["data"]["random_seed"]
+
+    # 1. Load raw (unnormalised) profiles
+    print("\n[1/6] Loading JUMP-CP profiles...")
     features, metadata = load_jump_profiles()
 
-    # 2. Normalise
-    print("\n[2/5] Normalising features (robust MAD scaling)...")
-    features_norm = robust_normalise(features)
-    print(f"  Feature matrix: {features_norm.shape[0]} wells × {features_norm.shape[1]} features")
-
-    # 3. Load ChEMBL MoA
-    print("\n[3/5] Loading ChEMBL MoA annotations...")
+    # 2. Load ChEMBL MoA
+    print("\n[2/6] Loading ChEMBL MoA annotations...")
     chembl_df = load_chembl_moa()
     moa_counts = chembl_df["moa"].value_counts()
     print(f"  Unique MoA classes: {len(moa_counts)}")
     print(f"  Top 5 classes:\n{moa_counts.head().to_string()}")
 
-    # 4. Load JUMP compound metadata
-    print("\n[4/5] Loading JUMP compound metadata...")
+    # 3. Load JUMP compound metadata
+    print("\n[3/6] Loading JUMP compound metadata...")
     jump_meta = load_jump_compound_meta()
 
-    # 5. Match
-    print("\n[5/5] Matching profiles to MoA annotations...")
-    matched = match_profiles_to_moa(features_norm, metadata, chembl_df, jump_meta)
+    # 4. Match — this only needs the join keys in `metadata`, not feature
+    #    values, so it's safe (and necessary) to do before normalising.
+    print("\n[4/6] Matching profiles to MoA annotations...")
+    matched = match_profiles_to_moa(features, metadata, chembl_df, jump_meta)
 
     if matched.empty:
         print("\n[warn] No matches found — saving mock-matched dataset for pipeline testing")
-        matched = _build_mock_matched(features_norm)
+        matched = _build_mock_matched(features)
+
+    # 5. Assign a compound-level train/val/test split BEFORE normalising.
+    print("\n[5/6] Assigning compound-level train/val/test split...")
+    matched = assign_compound_split(matched, train_frac, val_frac, seed)
+    print(f"  {matched['split'].value_counts().to_string()}")
+
+    # 6. Normalise using train-only statistics, then apply to every row.
+    print("\n[6/6] Normalising features (train-only robust MAD scaling)...")
+    train_profile_idx = (
+        matched.loc[matched["split"] == "train", "profile_idx"].astype(int).unique()
+    )
+    fit_mask = np.zeros(len(features), dtype=bool)
+    fit_mask[train_profile_idx] = True
+    features_norm = robust_normalise(features, fit_mask=fit_mask)
+    print(f"  Feature matrix: {features_norm.shape[0]} wells × {features_norm.shape[1]} features")
+    print(f"  Normalisation statistics fit on {fit_mask.sum()} training wells only")
 
     # ── Save outputs ──────────────────────────────────────────────────────────
     print("\nSaving processed files...")
@@ -282,6 +363,7 @@ def main(args):
         f"CellProfiler features:  {features_norm.shape[1]}",
         f"Unique MoA classes:     {chembl_df['moa'].nunique()}",
         f"Matched mol-morpho pairs: {len(matched)}",
+        f"Split sizes:\n{matched['split'].value_counts().to_string()}",
         f"MoA distribution:\n{matched['moa'].value_counts().to_string()}",
     ]
     stats_txt = "\n".join(stats)
@@ -292,14 +374,14 @@ def main(args):
     print("  python scripts/train.py --config configs/default.yaml")
 
 
-def _build_mock_matched(features_norm: pd.DataFrame) -> pd.DataFrame:
+def _build_mock_matched(features: pd.DataFrame) -> pd.DataFrame:
     """
     When real matching fails, build a synthetic matched DataFrame
     by replicating mock compounds across the first N profile rows.
     Useful for validating the full training pipeline on CPU.
     """
     mock = _mock_chembl()
-    n = min(len(features_norm), 120)
+    n = min(len(features), 120)
     rows = []
     for i in range(n):
         compound = mock.iloc[i % len(mock)]
@@ -315,5 +397,12 @@ def _build_mock_matched(features_norm: pd.DataFrame) -> pd.DataFrame:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw-dir", default="data/raw")
+    parser.add_argument(
+        "--config", default="configs/default.yaml",
+        help="Config providing data.train_split / data.val_split / "
+             "data.random_seed, used to assign the compound-level split "
+             "before normalisation. Must match the config passed to "
+             "scripts/train.py for the split to stay consistent.",
+    )
     args = parser.parse_args()
     main(args)
