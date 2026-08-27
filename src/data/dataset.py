@@ -43,8 +43,8 @@ class MorphoCLIPDataset(Dataset):
         self.graphs   = []
         self.profiles = []
         self.moa_labels = []
-        self.compound_ids = []   
-        self.splits = []        
+        self.compound_ids = []   # grouping key, used only for a safety check
+        self.splits = []         # pre-assigned by scripts/preprocess.py
 
         profiles_values = profiles[profile_cols].values
 
@@ -97,7 +97,9 @@ def get_dataloaders(profiles, matched, profile_cols, cfg):
         if len(idx) == 0:
             raise ValueError(f"Split '{name}' is empty after loading dataset items.")
 
-    # Safety net: re-verify the pre-assigned split really is leakage-free at the compound level
+    # Safety net: re-verify the pre-assigned split really is leakage-free at
+    # the compound level (catches bugs in preprocess.py's split assignment,
+    # or a matched_pairs.csv that was hand-edited / merged from elsewhere).
     train_groups = set(groups[train_idx])
     val_groups   = set(groups[val_idx])
     test_groups  = set(groups[test_idx])

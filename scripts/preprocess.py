@@ -154,12 +154,15 @@ def load_jump_profiles(raw_dir: str = "data/raw") -> tuple[pd.DataFrame, pd.Data
     return features, metadata
 
 
-def load_jump_compound_meta(path: str = "data/raw/jump_compound_metadata.csv.gz") -> pd.DataFrame:
-    """Load JUMP-CP compound metadata mapping broad_sample -> InChIKey -> SMILES."""
+def load_jump_compound_meta(path: str = "data/raw/jump_compound_metadata.tsv") -> pd.DataFrame:
+    """
+    Load JUMP-Target compound metadata mapping broad_sample -> InChIKey -> SMILES.
+    This is a TAB-separated file (JUMP-Target-2_compound_metadata.tsv), not CSV.
+    """
     if not os.path.exists(path):
         print("  [warn] JUMP compound metadata not found — skipping InChIKey join")
         return pd.DataFrame()
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, sep="\t")
     print(f"  JUMP compound metadata: {len(df)} compounds")
     return df
 
@@ -244,22 +247,50 @@ def match_profiles_to_moa(
     chembl_df = chembl_df.dropna(subset=["smiles"]).drop_duplicates(subset=["smiles"])
     print(f"  Valid ChEMBL SMILES after standardisation: {len(chembl_df)}")
 
-    # Try InChIKey join if compound metadata available
-    if not jump_meta.empty and "Metadata_InChIKey" in metadata.columns:
-        print("  Joining via InChIKey...")
+    
+    broad_sample_col = next(
+        (c for c in metadata.columns if "broad_sample" in c.lower()), None
+    )
+    have_inchikey_meta = (
+        not jump_meta.empty
+        and broad_sample_col is not None
+        and "broad_sample" in jump_meta.columns
+        and "InChIKey" in jump_meta.columns
+    )
+
+    if have_inchikey_meta:
+        print("  Joining via InChIKey (well -> JUMP compound metadata -> ChEMBL)...")
         from rdkit.Chem.inchi import MolToInchiKey
         chembl_df["inchikey"] = chembl_df["smiles"].apply(
             lambda s: MolToInchiKey(Chem.MolFromSmiles(s)) if s else None
         )
+
         meta_with_idx = metadata.copy()
         meta_with_idx["profile_idx"] = meta_with_idx.index
-        merged = meta_with_idx.merge(
+
+        # Step 1: well -> InChIKey, via broad_sample
+        jm = jump_meta[["broad_sample", "InChIKey"]].dropna().drop_duplicates()
+        meta_with_inchi = meta_with_idx.merge(
+            jm, left_on=broad_sample_col, right_on="broad_sample", how="inner",
+        )
+        print(f"  Wells resolved to a JUMP-Target InChIKey: {len(meta_with_inchi)}")
+
+        # Step 2: InChIKey -> ChEMBL MoA
+        merged = meta_with_inchi.merge(
             chembl_df[["inchikey", "smiles", "moa", "compound_name"]],
-            left_on="Metadata_InChIKey",
+            left_on="InChIKey",
             right_on="inchikey",
             how="inner",
         )
-    else:
+
+        if merged.empty:
+            print(
+                "  [warn] InChIKey join matched 0 rows — falling back to "
+                "name-based matching"
+            )
+            have_inchikey_meta = False
+
+    if not have_inchikey_meta:
         # Name-based fallback
         print("  Falling back to name-based matching...")
         name_col = next(
@@ -330,6 +361,10 @@ def main(args):
     print(f"  {matched['split'].value_counts().to_string()}")
 
     # 6. Normalise using train-only statistics, then apply to every row.
+    #    Fitting median/MAD on the full dataset (train+val+test) would leak
+    #    the held-out wells' distribution into every training example's
+    #    features. Fitting on train-only wells and applying that same
+    #    transform to val/test is the leakage-safe approach.
     print("\n[6/6] Normalising features (train-only robust MAD scaling)...")
     train_profile_idx = (
         matched.loc[matched["split"] == "train", "profile_idx"].astype(int).unique()

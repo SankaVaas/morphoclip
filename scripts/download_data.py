@@ -39,10 +39,12 @@ JUMP_PILOT_FILES = [
 ]
 
 # JUMP compound metadata: broad_sample -> InChIKey -> SMILES
-# Hosted on GitHub (confirmed stable)
+# Hosted on GitHub. NOTE: the JUMP-Target repo's default branch is `master`,
+# not `main` — using `main` 404s silently-ish (download_file swallows the
+# error and the InChIKey join is skipped for the whole run).
 JUMP_COMPOUND_META_URL = (
     "https://raw.githubusercontent.com/jump-cellpainting/JUMP-Target/"
-    "main/JUMP-Target-2_compound_metadata.tsv"
+    "master/JUMP-Target-2_compound_metadata.tsv"
 )
 
 # ChEMBL-derived MoA table with SMILES (Pat Walters' curated teaching dataset)
